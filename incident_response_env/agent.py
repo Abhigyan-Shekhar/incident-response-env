@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -224,22 +225,38 @@ class OpenAICompatiblePlanner:
     model_name: str
     api_key: str | None = None
     timeout_seconds: int = 45
+    max_retries: int = 3
 
     def next_action(self, observation: IncidentObservation) -> IncidentAction:
         payload = self._chat_payload(observation)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        response = requests.post(
-            self._chat_url(),
-            headers=headers,
-            json=payload,
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        data = response.json()
-        message = data["choices"][0]["message"]["content"]
-        return self._parse_action(message)
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(
+                    self._chat_url(),
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                )
+                if response.status_code == 429 and attempt < self.max_retries - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                message = data["choices"][0]["message"]["content"]
+                return self._parse_action(message, observation)
+            except requests.HTTPError as error:
+                last_error = error
+                if attempt < self.max_retries - 1 and getattr(error.response, "status_code", None) == 429:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("LLM planner failed without returning an action")
 
     def _chat_url(self) -> str:
         if self.api_base_url.endswith("/chat/completions"):
@@ -280,14 +297,83 @@ class OpenAICompatiblePlanner:
             ],
         }
 
-    def _parse_action(self, raw_text: str) -> IncidentAction:
+    def _parse_action(self, raw_text: str, observation: IncidentObservation) -> IncidentAction:
         match = re.search(r"\{.*\}", raw_text, flags=re.DOTALL)
         if not match:
-            raise ValueError(f"Model did not return JSON: {raw_text}")
-        payload = json.loads(match.group(0))
+            return self._fallback_action(raw_text, observation)
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return self._fallback_action(raw_text, observation)
         if "action" in payload and isinstance(payload["action"], dict):
             payload = payload["action"]
+        payload = self._normalize_payload(payload)
+        try:
+            return IncidentAction.model_validate(payload)
+        except Exception:
+            return self._fallback_action(raw_text, observation)
+
+    def _fallback_action(
+        self,
+        raw_text: str,
+        observation: IncidentObservation,
+    ) -> IncidentAction:
+        lowered = raw_text.lower()
+        action_type = next((action for action in [
+            "enable_circuit_breaker",
+            "submit_diagnosis",
+            "scale_up",
+            "rollback",
+            "restart",
+            "investigate",
+        ] if action in lowered), "investigate")
+        service = next((service for service in SERVICE_HINTS if service in lowered), None)
+        if not service:
+            unhealthy = [
+                service_state.name
+                for service_state in observation.services
+                if service_state.status != "healthy"
+            ]
+            service = unhealthy[0] if unhealthy else observation.services[0].name
+        payload: dict[str, object] = {"type": action_type, "service": service}
+        if action_type == "submit_diagnosis":
+            payload["cause"] = self._infer_cause(raw_text, observation)
         return IncidentAction.model_validate(payload)
+
+    def _infer_cause(self, raw_text: str, observation: IncidentObservation) -> str:
+        lowered = raw_text.lower()
+        for cause in [
+            "bad_model_deploy",
+            "cache_memory_pressure",
+            "connection_leak",
+            "out_of_memory",
+            "bad_deploy",
+            "oom",
+        ]:
+            if cause in lowered:
+                return "out_of_memory" if cause == "oom" else cause
+
+        logs = " ".join(" ".join(entries) for entries in observation.recent_logs.values()).lower()
+        if "oom" in logs or "heap" in logs:
+            return "out_of_memory"
+        if "checksum" in logs or "artifact" in logs:
+            return "bad_model_deploy"
+        if "deploy" in logs or "rollout" in logs:
+            return "bad_deploy"
+        if "too many clients" in logs or "connection pool" in logs:
+            return "connection_leak"
+        if "maxmemory" in logs or "evict" in logs:
+            return "cache_memory_pressure"
+        return "bad_deploy"
+
+    @staticmethod
+    def _normalize_payload(payload: dict[str, object]) -> dict[str, object]:
+        normalized = dict(payload)
+        for key in ("service", "cause", "notes"):
+            value = normalized.get(key)
+            if isinstance(value, str) and value.strip().lower() == "null":
+                normalized[key] = None
+        return normalized
 
 
 def build_planner(mode: str) -> Planner:

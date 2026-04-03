@@ -1,6 +1,10 @@
+from fastapi.testclient import TestClient
+
+from incident_response_env.agent import OpenAICompatiblePlanner
 from incident_response_env import build_planner
 from incident_response_env.environment import IncidentResponseEnvironment
 from incident_response_env.models import IncidentAction
+from incident_response_env.server.app import app
 
 
 def test_easy_perfect_trajectory_scores_ninety_basis_points() -> None:
@@ -75,3 +79,58 @@ def test_default_heuristic_scores_descend_with_difficulty() -> None:
         scores.append(observation.score_breakdown.total)
 
     assert scores[0] > scores[1] > scores[2]
+
+
+def test_llm_parser_normalizes_string_nulls() -> None:
+    planner = OpenAICompatiblePlanner(api_base_url="https://example.com", model_name="demo")
+    env = IncidentResponseEnvironment()
+    observation = env.reset(difficulty="easy")
+
+    action = planner._parse_action(  # type: ignore[attr-defined]
+        '{"type":"investigate","service":"api-gateway","cause":"null","notes":"null"}',
+        observation,
+    )
+
+    assert action.type == "investigate"
+    assert action.service == "api-gateway"
+    assert action.cause is None
+
+
+def test_llm_parser_falls_back_from_prose_response() -> None:
+    planner = OpenAICompatiblePlanner(api_base_url="https://example.com", model_name="demo")
+    env = IncidentResponseEnvironment()
+    observation = env.reset(difficulty="easy")
+
+    action = planner._parse_action(  # type: ignore[attr-defined]
+        "The next best action is investigate api-gateway to confirm the OOM issue.",
+        observation,
+    )
+
+    assert action.type == "investigate"
+    assert action.service == "api-gateway"
+
+
+def test_http_app_preserves_episode_state_between_requests() -> None:
+    client = TestClient(app)
+    episode_id = "http-test-episode"
+
+    reset_response = client.post(
+        "/reset",
+        json={"difficulty": "easy", "episode_id": episode_id},
+    )
+    assert reset_response.status_code == 200
+    reset_payload = reset_response.json()
+    assert reset_payload["metadata"]["episode_id"] == episode_id
+
+    step_response = client.post(
+        "/step",
+        json={
+            "episode_id": episode_id,
+            "action": {"type": "investigate", "service": "api-gateway"},
+        },
+    )
+    assert step_response.status_code == 200
+    step_payload = step_response.json()
+
+    assert "OOMKilled" in step_payload["observation"]["action_feedback"]
+    assert step_payload["metadata"]["step_count"] == 1

@@ -5,7 +5,6 @@ from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..compat import OPENENV_AVAILABLE, openenv_create_app
 from ..environment import IncidentResponseEnvironment
 from ..models import IncidentAction, IncidentObservation, IncidentState
 
@@ -22,64 +21,91 @@ class StepBody(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     action: IncidentAction
+    episode_id: str | None = None
     timeout_s: float | None = None
 
 
-if OPENENV_AVAILABLE and openenv_create_app is not None:
-    app = openenv_create_app(
-        IncidentResponseEnvironment,
-        IncidentAction,
-        IncidentObservation,
-        env_name="incident_response_env",
+app = FastAPI(title="IncidentResponseEnv", version="0.1.0")
+_sessions: dict[str, IncidentResponseEnvironment] = {}
+_current_episode_id: str | None = None
+
+
+def _resolve_env(episode_id: str | None) -> IncidentResponseEnvironment | None:
+    global _current_episode_id
+
+    target_episode_id = episode_id or _current_episode_id
+    if target_episode_id is None:
+        return None
+    env = _sessions.get(target_episode_id)
+    if env is not None:
+        _current_episode_id = target_episode_id
+    return env
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    return {
+        "name": "IncidentResponseEnv",
+        "description": "Deterministic SRE on-call incident triage environment.",
+    }
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "healthy"}
+
+
+@app.get("/schema")
+def schema() -> dict[str, Any]:
+    return {
+        "action": IncidentAction.model_json_schema(),
+        "observation": IncidentObservation.model_json_schema(),
+        "state": IncidentState.model_json_schema(),
+    }
+
+
+@app.post("/reset")
+def reset(body: ResetBody) -> dict[str, Any]:
+    global _current_episode_id
+
+    env = IncidentResponseEnvironment()
+    observation = env.reset(
+        seed=body.seed,
+        episode_id=body.episode_id,
+        difficulty=body.difficulty,
     )
-else:
-    app = FastAPI(title="IncidentResponseEnv", version="0.1.0")
-    _env = IncidentResponseEnvironment()
+    episode_id = str(observation.metadata["episode_id"])
+    _sessions[episode_id] = env
+    _current_episode_id = episode_id
+    return {
+        "observation": observation.model_dump(exclude={"reward", "done", "metadata"}),
+        "reward": observation.reward,
+        "done": observation.done,
+        "metadata": observation.metadata,
+    }
 
-    @app.get("/")
-    def root() -> dict[str, str]:
-        return {
-            "name": "IncidentResponseEnv",
-            "description": "Deterministic SRE on-call incident triage environment.",
-        }
 
-    @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "healthy"}
+@app.post("/step")
+def step(body: StepBody) -> dict[str, Any]:
+    env = _resolve_env(body.episode_id)
+    if env is None:
+        observation = IncidentResponseEnvironment().step(body.action, timeout_s=body.timeout_s)
+    else:
+        observation = env.step(body.action, timeout_s=body.timeout_s)
+    return {
+        "observation": observation.model_dump(exclude={"reward", "done", "metadata"}),
+        "reward": observation.reward,
+        "done": observation.done,
+        "metadata": observation.metadata,
+    }
 
-    @app.get("/schema")
-    def schema() -> dict[str, Any]:
-        return {
-            "action": IncidentAction.model_json_schema(),
-            "observation": IncidentObservation.model_json_schema(),
-            "state": IncidentState.model_json_schema(),
-        }
 
-    @app.post("/reset")
-    def reset(body: ResetBody) -> dict[str, Any]:
-        observation = _env.reset(
-            seed=body.seed,
-            episode_id=body.episode_id,
-            difficulty=body.difficulty,
-        )
-        return {
-            "observation": observation.model_dump(exclude={"reward", "done", "metadata"}),
-            "reward": observation.reward,
-            "done": observation.done,
-        }
-
-    @app.post("/step")
-    def step(body: StepBody) -> dict[str, Any]:
-        observation = _env.step(body.action, timeout_s=body.timeout_s)
-        return {
-            "observation": observation.model_dump(exclude={"reward", "done", "metadata"}),
-            "reward": observation.reward,
-            "done": observation.done,
-        }
-
-    @app.get("/state")
-    def state() -> dict[str, Any]:
-        return _env.state.model_dump()
+@app.get("/state")
+def state(episode_id: str | None = None) -> dict[str, Any]:
+    env = _resolve_env(episode_id)
+    if env is None:
+        return IncidentState().model_dump()
+    return env.state.model_dump()
 
 
 def main() -> None:
