@@ -1,8 +1,8 @@
 ---
 title: IncidentResponseEnv
-emoji: fire
+emoji: 🚨
 colorFrom: red
-colorTo: orange
+colorTo: pink
 sdk: docker
 pinned: false
 app_port: 8000
