@@ -36,6 +36,7 @@ def main() -> None:
         reset_response.raise_for_status()
         payload = reset_response.json()
         observation = IncidentObservation.model_validate(payload["observation"])
+        episode_id = payload["metadata"]["episode_id"]
         print("[START]", json.dumps({"task_id": difficulty, "episode": 1}, sort_keys=True), flush=True)
 
         steps = 0
@@ -45,7 +46,10 @@ def main() -> None:
             action = planner.next_action(observation)
             step_response = requests.post(
                 SPACE_URL + "/step",
-                json={"action": action.model_dump(exclude_none=True)},
+                json={
+                    "episode_id": episode_id,
+                    "action": action.model_dump(exclude_none=True),
+                },
                 timeout=30,
             )
             step_response.raise_for_status()

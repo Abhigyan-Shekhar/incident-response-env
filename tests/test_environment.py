@@ -110,6 +110,21 @@ def test_llm_parser_falls_back_from_prose_response() -> None:
     assert action.service == "api-gateway"
 
 
+def test_llm_guardrail_replaces_redundant_investigation() -> None:
+    planner = OpenAICompatiblePlanner(api_base_url="https://example.com", model_name="demo")
+    env = IncidentResponseEnvironment()
+    env.reset(difficulty="easy")
+    observation = env.step(IncidentAction(type="investigate", service="api-gateway"))
+
+    action = planner._coerce_action(  # type: ignore[attr-defined]
+        IncidentAction(type="investigate", service="api-gateway"),
+        observation,
+    )
+
+    assert action.type == "scale_up"
+    assert action.service == "api-gateway"
+
+
 def test_http_app_preserves_episode_state_between_requests() -> None:
     client = TestClient(app)
     episode_id = "http-test-episode"

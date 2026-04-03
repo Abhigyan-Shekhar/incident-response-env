@@ -247,7 +247,8 @@ class OpenAICompatiblePlanner:
                 response.raise_for_status()
                 data = response.json()
                 message = data["choices"][0]["message"]["content"]
-                return self._parse_action(message, observation)
+                action = self._parse_action(message, observation)
+                return self._coerce_action(action, observation)
             except requests.HTTPError as error:
                 last_error = error
                 if attempt < self.max_retries - 1 and getattr(error.response, "status_code", None) == 429:
@@ -334,7 +335,12 @@ class OpenAICompatiblePlanner:
                 for service_state in observation.services
                 if service_state.status != "healthy"
             ]
-            service = unhealthy[0] if unhealthy else observation.services[0].name
+            if unhealthy:
+                service = unhealthy[0]
+            elif observation.services:
+                service = observation.services[0].name
+            else:
+                service = "api-gateway"
         payload: dict[str, object] = {"type": action_type, "service": service}
         if action_type == "submit_diagnosis":
             payload["cause"] = self._infer_cause(raw_text, observation)
@@ -374,6 +380,34 @@ class OpenAICompatiblePlanner:
             if isinstance(value, str) and value.strip().lower() == "null":
                 normalized[key] = None
         return normalized
+
+    @staticmethod
+    def _coerce_action(
+        action: IncidentAction,
+        observation: IncidentObservation,
+    ) -> IncidentAction:
+        fallback = HeuristicPlanner().next_action(observation)
+        available_services = {service.name for service in observation.services}
+        investigated = set(observation.investigated_services)
+        resolved = set(observation.resolved_services)
+
+        if action.service and available_services and action.service not in available_services:
+            return fallback
+        if action.service and action.service in resolved and action.type != "submit_diagnosis":
+            return fallback
+        if action.type == "investigate" and action.service in investigated:
+            return fallback
+        if action.type in {"rollback", "scale_up", "restart"} and (
+            action.service not in investigated
+            or fallback.type != action.type
+            or fallback.service != action.service
+        ):
+            return fallback
+        if action.type == "submit_diagnosis":
+            if action.service not in investigated or fallback.type != "submit_diagnosis":
+                return fallback
+            return fallback
+        return action
 
 
 def build_planner(mode: str) -> Planner:
