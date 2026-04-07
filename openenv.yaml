@@ -1,5 +1,8 @@
 spec_version: 1
 name: incident_response_env
+version: "1.0.0"
+description: "SRE incident triage environment — AI agent diagnoses and remediates production failures"
+author: "Team Data Driven"
 type: space
 runtime: fastapi
 app: server.app:app

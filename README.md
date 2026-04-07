@@ -92,28 +92,36 @@ On multi-root-cause incidents, restoration and diagnosis are apportioned across 
 
 ## Verified Baseline Results
 
-The live baseline was run end-to-end against the deployed Hugging Face Space with the Groq OpenAI-compatible endpoint:
+The live baseline was run end-to-end against the deployed Hugging Face Space with the Groq OpenAI-compatible endpoint (`llama-3.3-70b-versatile`):
 
 | Task | Score | Steps | Success |
 | --- | --- | --- | --- |
-| `easy` | `0.75` | `3` | `true` |
-| `medium` | `0.7063` | `6` | `true` |
-| `hard` | `0.6611` | `11` | `true` |
+| `easy` | `0.90` | `3` | `true` |
+| `medium` | `0.82` | `9` | `true` |
+| `hard` | `0.65` | `13` | `true` |
 
-Mean reward across the three tasks: `0.7058`
+Mean reward across the three tasks: `0.79`
 
 This gives a clear downward difficulty curve while still demonstrating successful completion on all tasks.
 
 ## Quick Start
 
-Create a local environment and run the deterministic baseline:
+Create a local environment and run the baseline:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 python3 -m pytest
-python3 inference.py --planner heuristic
+```
+
+Run the inference baseline (requires Groq API key):
+
+```bash
+API_BASE_URL="https://api.groq.com/openai/v1" \
+MODEL_NAME="llama-3.3-70b-versatile" \
+HF_TOKEN="$YOUR_GROQ_API_KEY" \
+python3 inference.py
 ```
 
 Start the HTTP server locally:
@@ -129,19 +137,19 @@ source .venv/bin/activate
 python3 -m openenv.cli validate
 ```
 
-## LLM Baseline
+## Inference Strategy
 
-`inference.py` supports:
+`inference.py` uses a 3-tier decision strategy:
 
-- `--planner heuristic` for the deterministic baseline
-- `--planner llm` for an OpenAI-compatible endpoint
-- `--planner auto` to use the LLM when configured and otherwise fall back to heuristics
+1. **Primary LLM** (`llama-3.3-70b-versatile` via Groq) — Makes decisions using conversation history and environment state
+2. **Backup LLM** (`llama-3.1-8b-instant`) — Automatically used when primary model hits rate limits (429) or context limits (413)
+3. **Heuristic fallback** — Deterministic Python rules that take over when both LLMs fail, ensuring episodes always complete
 
-Expected environment variables:
+Required environment variables:
 
-- `API_BASE_URL`
-- `MODEL_NAME`
-- `HF_TOKEN`
+- `API_BASE_URL` — The API endpoint (default: `https://api.groq.com/openai/v1`)
+- `MODEL_NAME` — The model identifier (default: `llama-3.3-70b-versatile`)
+- `HF_TOKEN` — Your Groq API key
 
 Example with Groq:
 
@@ -149,14 +157,7 @@ Example with Groq:
 API_BASE_URL="https://api.groq.com/openai/v1" \
 MODEL_NAME="llama-3.3-70b-versatile" \
 HF_TOKEN="$YOUR_GROQ_API_KEY" \
-python3 inference.py --planner llm
-```
-
-To verify the live deployed environment end to end:
-
-```bash
-source .venv/bin/activate
-PYTHONPATH=. python3 scripts/live_space_eval.py
+python3 inference.py
 ```
 
 ## Deployment

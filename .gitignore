@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+outputs/
+uv.lock
