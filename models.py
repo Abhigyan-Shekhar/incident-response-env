@@ -4,8 +4,11 @@ from incident_response_env.models import (
     IncidentAction,
     IncidentObservation,
     IncidentState,
+    PostMortemIssue,
+    PostMortemReport,
     ScoreBreakdown,
     ServiceHealth,
+    ServiceMetrics,
     ServiceStatus,
     Severity,
 )
@@ -16,8 +19,11 @@ __all__ = [
     "IncidentAction",
     "IncidentObservation",
     "IncidentState",
+    "PostMortemIssue",
+    "PostMortemReport",
     "ScoreBreakdown",
     "ServiceHealth",
+    "ServiceMetrics",
     "ServiceStatus",
     "Severity",
 ]

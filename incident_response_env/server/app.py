@@ -108,6 +108,15 @@ def state(episode_id: str | None = None) -> dict[str, Any]:
     return env.state.model_dump()
 
 
+@app.get("/postmortem")
+def postmortem(episode_id: str | None = None) -> dict[str, Any]:
+    env = _resolve_env(episode_id)
+    if env is None:
+        return {"postmortem": None}
+    report = env.state.postmortem
+    return {"postmortem": report.model_dump() if report is not None else None}
+
+
 def main() -> None:
     import uvicorn
 

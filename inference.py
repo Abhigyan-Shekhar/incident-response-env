@@ -6,6 +6,7 @@ from openai import OpenAI
 from incident_response_env import IncidentResponseEnvironment
 from incident_response_env.models import IncidentAction
 from incident_response_env.agent import HeuristicPlanner
+from incident_response_env.scenarios import SCENARIOS
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.groq.com/openai/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
@@ -39,10 +40,14 @@ def build_compact_state(obs):
     
     # Only include logs for unhealthy services
     logs = {}
+    metrics = {}
     unhealthy_names = {s.name for s in obs.services if s.status != "healthy"}
     for svc, entries in obs.recent_logs.items():
         if svc in unhealthy_names or svc in obs.investigated_services:
             logs[svc] = entries
+    for svc, snapshot in obs.metrics.items():
+        if svc in unhealthy_names or svc in obs.investigated_services:
+            metrics[svc] = snapshot.model_dump()
     
     return {
         "difficulty": obs.difficulty,
@@ -50,6 +55,7 @@ def build_compact_state(obs):
         "unhealthy_services": services,
         "alerts": alerts,
         "relevant_logs": logs,
+        "relevant_metrics": metrics,
         "investigated": obs.investigated_services,
         "diagnosed": obs.diagnosed_services,
         "resolved": obs.resolved_services,
@@ -115,76 +121,79 @@ def run_episode(level: str):
     done = False
     step_count = 0
     rewards = []
+    try:
+        while not done and step_count < 15:
+            step_count += 1
+            compact_state = build_compact_state(obs)
+            user_msg = json.dumps(compact_state, indent=2)
+            messages.append({"role": "user", "content": f"Step {step_count}. Current state:\n{user_msg}"})
 
-    while not done and step_count < 15:
-        step_count += 1
-        compact_state = build_compact_state(obs)
-        user_msg = json.dumps(compact_state, indent=2)
-        messages.append({"role": "user", "content": f"Step {step_count}. Current state:\n{user_msg}"})
+            error_msg = "null"
+            action = None
 
-        error_msg = "null"
-        action = None
-
-        if client and HF_TOKEN:
-            # Trim conversation history to prevent 413 (keep system + last 6 exchanges)
-            if len(messages) > 13:
-                messages = [messages[0]] + messages[-12:]
+            if client and HF_TOKEN:
+                # Trim conversation history to prevent 413 (keep system + last 6 exchanges)
+                if len(messages) > 13:
+                    messages = [messages[0]] + messages[-12:]
+                
+                models_to_try = [MODEL_NAME, BACKUP_MODEL]
+                for model_attempt in models_to_try:
+                    try:
+                        response = client.chat.completions.create(
+                            model=model_attempt,
+                            messages=messages,
+                            temperature=0.1,
+                        )
+                        content = response.choices[0].message.content
+                        messages.append({"role": "assistant", "content": content})
+                        action, parse_error = parse_llm_response(content, obs, heuristic)
+                        if parse_error:
+                            error_msg = parse_error
+                        break
+                    except Exception as e:
+                        err_str = str(e)
+                        if ("429" in err_str or "413" in err_str) and model_attempt == MODEL_NAME:
+                            time.sleep(1)
+                            continue
+                        error_msg = err_str.replace(" ", "_").replace("\n", "_")[:100]
+                        action = heuristic.next_action(obs)
+                        messages.append({"role": "assistant", "content": json.dumps(action.model_dump(exclude_none=True))})
+                        break
             
-            models_to_try = [MODEL_NAME, BACKUP_MODEL]
-            for model_attempt in models_to_try:
-                try:
-                    response = client.chat.completions.create(
-                        model=model_attempt,
-                        messages=messages,
-                        temperature=0.1,
-                    )
-                    content = response.choices[0].message.content
-                    messages.append({"role": "assistant", "content": content})
-                    action, parse_error = parse_llm_response(content, obs, heuristic)
-                    if parse_error:
-                        error_msg = parse_error
-                    break  # Success
-                except Exception as e:
-                    err_str = str(e)
-                    if ("429" in err_str or "413" in err_str) and model_attempt == MODEL_NAME:
-                        # Rate limited or too large, try backup
-                        time.sleep(1)
-                        continue
-                    error_msg = err_str.replace(" ", "_").replace("\n", "_")[:100]
-                    action = heuristic.next_action(obs)
-                    messages.append({"role": "assistant", "content": json.dumps(action.model_dump(exclude_none=True))})
-                    break
-        
-        if action is None:
-            action = heuristic.next_action(obs)
-            messages.append({"role": "assistant", "content": json.dumps(action.model_dump(exclude_none=True))})
+            if action is None:
+                action = heuristic.next_action(obs)
+                messages.append({"role": "assistant", "content": json.dumps(action.model_dump(exclude_none=True))})
 
-        # Format action trace for stdout
-        action_str = f"{action.type}('{action.service}')"
-        if action.type == "submit_diagnosis":
-            cause_str = (action.cause or "unknown").replace(" ", "_")
-            action_str = f"submit_diagnosis('{action.service}','{cause_str}')"
+            action_str = f"{action.type}('{action.service}')"
+            if action.type == "submit_diagnosis":
+                cause_str = (action.cause or "unknown").replace(" ", "_")
+                action_str = f"submit_diagnosis('{action.service}','{cause_str}')"
 
-        obs = env.step(action)
-        done = obs.done
-        reward = obs.reward
-        rewards.append(reward)
+            obs = env.step(action)
+            done = obs.done
+            reward = obs.reward
+            rewards.append(reward)
 
-        print(f"[STEP] step={step_count} action={action_str} reward={reward:.2f} done={str(done).lower()} error={error_msg}")
+            print(f"[STEP] step={step_count} action={action_str} reward={reward:.2f} done={str(done).lower()} error={error_msg}")
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
 
-    state = env.state
-    success = state.success
-    score = state.score_breakdown.total
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    if not rewards_str:
-        rewards_str = "0.00"
+        state = env.state
+        success = state.success
+        score = state.score_breakdown.total
+        rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+        if not rewards_str:
+            rewards_str = "0.00"
 
-    print(f"[END] success={str(success).lower()} steps={step_count} score={score:.2f} rewards={rewards_str}")
+        print(f"[END] success={str(success).lower()} steps={step_count} score={score:.2f} rewards={rewards_str}")
     return score, success
 
 
 def main():
-    levels = ["easy", "medium", "hard"]
+    levels = list(SCENARIOS)
     scores = {}
     for level in levels:
         score, success = run_episode(level)
