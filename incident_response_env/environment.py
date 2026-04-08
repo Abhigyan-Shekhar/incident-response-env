@@ -5,8 +5,24 @@ from typing import Optional
 from uuid import uuid4
 
 from .compat import EnvironmentMetadata, OpenEnvEnvironment
-from .models import Alert, IncidentAction, IncidentObservation, IncidentState, ScoreBreakdown, ServiceStatus
-from .scenarios import IssueDefinition, ScenarioDefinition, get_scenario, normalize_text
+from .models import (
+    Alert,
+    IncidentAction,
+    IncidentObservation,
+    IncidentState,
+    PostMortemIssue,
+    PostMortemReport,
+    ScoreBreakdown,
+    ServiceMetrics,
+    ServiceStatus,
+)
+from .scenarios import (
+    IssueDefinition,
+    MetricSnapshot,
+    ScenarioDefinition,
+    get_scenario,
+    normalize_text,
+)
 
 STATUS_RANK = {"healthy": 0, "degraded": 1, "down": 2}
 RANK_TO_STATUS = {value: key for key, value in STATUS_RANK.items()}
@@ -27,7 +43,18 @@ class IssueRuntime:
     diagnosed: bool = False
     diagnosed_before_fix: bool = False
     resolved: bool = False
+    investigation_step: int | None = None
+    diagnosis_step: int | None = None
     resolution_step: int | None = None
+
+
+@dataclass
+class ActionJournalEntry:
+    step: int
+    action_type: str
+    service: str | None
+    cause: str | None
+    feedback: str
 
 
 class IncidentResponseEnvironment(OpenEnvEnvironment):
@@ -42,6 +69,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
         self._circuit_breakers: set[str] = set()
         self._issue_state: dict[str, IssueRuntime] = {}
         self._investigation_notes: dict[str, list[str]] = {}
+        self._action_journal: list[ActionJournalEntry] = []
         self._last_feedback = "Environment is ready. Call reset() to start a new incident."
 
     def reset(
@@ -64,6 +92,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
             for issue in sorted(scenario.issues, key=lambda item: item.priority)
         }
         self._investigation_notes = {}
+        self._action_journal = []
         self._last_feedback = (
             f"Incident initialized for {scenario.title}. "
             f"Use investigate before committing to a diagnosis."
@@ -103,6 +132,16 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
         else:
             feedback = handler(action)
 
+        self._action_journal.append(
+            ActionJournalEntry(
+                step=self._step_count,
+                action_type=action.type,
+                service=action.service,
+                cause=action.cause,
+                feedback=feedback,
+            )
+        )
+
         success = self._success()
         if success or self._step_count >= self._scenario.max_steps:
             self._done = True
@@ -115,7 +154,8 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
     def state(self) -> IncidentState:
         if self._scenario is None:
             return IncidentState()
-        services, alerts, logs = self._visible_snapshot()
+        services, alerts, logs, metrics = self._visible_snapshot()
+        score_breakdown = self._score_breakdown()
         return IncidentState(
             episode_id=self._episode_id,
             step_count=self._step_count,
@@ -125,6 +165,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
             services=services,
             alerts=alerts,
             recent_logs=logs,
+            metrics=metrics,
             investigated_services=self._investigated_services(),
             diagnosed_services=sorted(
                 runtime.definition.service
@@ -138,7 +179,8 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
             ),
             failed_actions=self._failed_actions,
             success=self._success(),
-            score_breakdown=self._score_breakdown(),
+            score_breakdown=score_breakdown,
+            postmortem=self._build_postmortem(score_breakdown),
         )
 
     def get_metadata(self) -> EnvironmentMetadata:
@@ -146,9 +188,9 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
             name="IncidentResponseEnv",
             description=(
                 "Deterministic SRE incident-response environment with easy, medium, "
-                "and hard triage scenarios."
+                "hard, severe, and critical triage scenarios."
             ),
-            version="0.1.0",
+            version="0.2.0",
         )
 
     def _handle_investigate(self, action: IncidentAction) -> str:
@@ -161,6 +203,8 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
         runtime = self._issue_for_service(service)
         if runtime is not None:
             runtime.investigated = True
+            if runtime.investigation_step is None:
+                runtime.investigation_step = self._step_count
             notes.extend(runtime.definition.investigation_evidence)
         if service in self._scenario.investigation_map:
             notes.extend(self._scenario.investigation_map[service])
@@ -194,6 +238,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
             return f"Diagnosis for {service} is already on record."
 
         runtime.diagnosed = True
+        runtime.diagnosis_step = self._step_count
         if not runtime.resolved:
             runtime.diagnosed_before_fix = True
         return f"Diagnosis accepted: {service} root cause is {runtime.definition.display_cause}."
@@ -203,6 +248,24 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
         service = action.service or ""
         if service not in self._scenario.services:
             return f"Unknown service '{service}'."
+
+        runtime = self._issue_for_service(service)
+        if runtime is not None and runtime.definition.remediation == "enable_circuit_breaker":
+            if runtime.resolved:
+                return f"{service} is already resolved."
+            blocking = self._blocking_services(runtime)
+            if blocking:
+                return (
+                    f"enable_circuit_breaker on {service} did not stick because upstream priorities are "
+                    f"still unresolved: {', '.join(blocking)}."
+                )
+            if service in self._circuit_breakers:
+                return f"Circuit breaker for {service} is already enabled."
+            self._circuit_breakers.add(service)
+            runtime.resolved = True
+            runtime.resolution_step = self._step_count
+            return runtime.definition.recovery_log
+
         if not self._service_is_impacted(service):
             return (
                 f"Circuit breaker on {service} has no meaningful effect because the "
@@ -233,12 +296,8 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
                 f"{action.type} is not the correct remediation for {service}. "
                 "Penalty applied."
             )
-        if any(not self._issue_state[issue_id].resolved for issue_id in runtime.definition.prerequisites):
-            blocking = [
-                self._issue_state[issue_id].definition.service
-                for issue_id in runtime.definition.prerequisites
-                if not self._issue_state[issue_id].resolved
-            ]
+        blocking = self._blocking_services(runtime)
+        if blocking:
             return (
                 f"{action.type} on {service} did not stick because upstream priorities are "
                 f"still unresolved: {', '.join(blocking)}."
@@ -250,7 +309,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
 
     def _build_observation(self, feedback: str, reward: float) -> IncidentObservation:
         assert self._scenario is not None
-        services, alerts, logs = self._visible_snapshot()
+        services, alerts, logs, metrics = self._visible_snapshot()
         score_breakdown = self._score_breakdown()
         self._last_feedback = feedback
         return IncidentObservation(
@@ -260,6 +319,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
             services=services,
             alerts=alerts,
             recent_logs=logs,
+            metrics=metrics,
             action_feedback=feedback,
             valid_actions=VALID_ACTIONS,
             investigated_services=self._investigated_services(),
@@ -274,6 +334,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
                 if runtime.resolved
             ),
             score_breakdown=score_breakdown,
+            postmortem=self._build_postmortem(score_breakdown),
             reward=reward,
             done=self._done,
             metadata={
@@ -287,19 +348,23 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
         return IncidentObservation(
             difficulty="uninitialized",
             title="IncidentResponseEnv",
-            summary="Call reset() with easy, medium, or hard to start an incident.",
+            summary="Call reset() with easy, medium, hard, severe, or critical to start an incident.",
             services=[],
             alerts=[],
             recent_logs={},
+            metrics={},
             action_feedback=feedback,
             valid_actions=VALID_ACTIONS,
             score_breakdown=ScoreBreakdown(),
+            postmortem=None,
             reward=0.0,
             done=False,
             metadata={"episode_id": None, "step_count": 0, "success": False},
         )
 
-    def _visible_snapshot(self) -> tuple[list[ServiceStatus], list[Alert], dict[str, list[str]]]:
+    def _visible_snapshot(
+        self,
+    ) -> tuple[list[ServiceStatus], list[Alert], dict[str, list[str]], dict[str, ServiceMetrics]]:
         assert self._scenario is not None
         service_state = {
             name: {
@@ -310,6 +375,10 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
         }
         logs: dict[str, list[str]] = {
             name: [seed.base_log]
+            for name, seed in self._scenario.services.items()
+        }
+        metrics = {
+            name: self._snapshot_to_metrics(seed.metrics)
             for name, seed in self._scenario.services.items()
         }
         alerts: list[Alert] = []
@@ -328,6 +397,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
                 alert_severity = impact.alert_severity
                 alert_text = impact.alert_text
                 log_text = impact.log_text
+                impact_metrics = impact.metrics
 
                 if impact.service in self._circuit_breakers and impact.service != issue.service:
                     rank = max(rank - 1, 0)
@@ -344,6 +414,11 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
                         f"{impact.service}: circuit breaker opened while {issue.service} "
                         "remains unhealthy"
                     )
+                    impact_metrics = self._blend_metrics(
+                        self._scenario.services[impact.service].metrics,
+                        impact.metrics,
+                        blend_ratio=0.35,
+                    )
 
                 if rank > STATUS_RANK[service_state[impact.service]["status"]]:
                     service_state[impact.service]["status"] = RANK_TO_STATUS[rank]
@@ -357,6 +432,7 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
                         )
                     )
                     logs[impact.service].append(log_text)
+                    metrics[impact.service] = self._merge_metrics(metrics[impact.service], impact_metrics)
 
         services = [
             ServiceStatus(
@@ -372,7 +448,90 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
         severity_rank = {"info": 0, "warning": 1, "critical": 2}
         alerts.sort(key=lambda item: (severity_rank[item.severity], item.service), reverse=True)
         deduped_logs = {service: self._dedupe(entries)[-4:] for service, entries in logs.items()}
-        return services, alerts, deduped_logs
+        return services, alerts, deduped_logs, metrics
+
+    def _build_postmortem(self, score_breakdown: ScoreBreakdown) -> PostMortemReport | None:
+        if self._scenario is None:
+            return None
+
+        root_causes = [
+            PostMortemIssue(
+                service=runtime.definition.service,
+                root_cause=runtime.definition.display_cause,
+                remediation=runtime.definition.remediation,
+                priority=runtime.definition.priority,
+                blast_radius=sorted(
+                    {
+                        impact.service
+                        for impact in runtime.definition.impacts
+                        if impact.service != runtime.definition.service
+                    }
+                ),
+                investigated=runtime.investigated,
+                diagnosed=runtime.diagnosed,
+                resolved=runtime.resolved,
+                investigation_step=runtime.investigation_step,
+                diagnosis_step=runtime.diagnosis_step,
+                resolution_step=runtime.resolution_step,
+            )
+            for runtime in sorted(self._issue_state.values(), key=lambda item: item.definition.priority)
+        ]
+
+        impacted_services = sorted(
+            {
+                impact.service
+                for runtime in self._issue_state.values()
+                for impact in runtime.definition.impacts
+            }
+        )
+        if not impacted_services:
+            impacted_services = sorted(runtime.definition.service for runtime in self._issue_state.values())
+
+        if self._success():
+            status = "resolved"
+        elif self._done:
+            status = "failed"
+        else:
+            status = "in_progress"
+
+        resolved_count = sum(1 for runtime in self._issue_state.values() if runtime.resolved)
+        total_issues = len(self._issue_state)
+        if status == "resolved":
+            summary = (
+                f"Resolved {total_issues} root cause(s) in {self._step_count} steps with final score "
+                f"{score_breakdown.total:.2f}."
+            )
+        elif status == "failed":
+            summary = (
+                f"Incident closed without full recovery: {resolved_count}/{total_issues} root cause(s) "
+                f"resolved in {self._step_count} steps."
+            )
+        else:
+            summary = (
+                f"Incident still in progress after {self._step_count} steps with "
+                f"{resolved_count}/{total_issues} root cause(s) resolved."
+            )
+
+        timeline = [
+            f"step {entry.step}: {self._format_action(entry)} -> {entry.feedback}"
+            for entry in self._action_journal
+        ]
+        if not timeline:
+            timeline = ["No actions have been recorded yet."]
+
+        lessons_learned = self._dedupe(self._lessons_learned())
+        return PostMortemReport(
+            status=status,
+            incident_title=self._scenario.title,
+            summary=summary,
+            total_steps=self._step_count,
+            failed_actions=self._failed_actions,
+            final_score=score_breakdown.total,
+            impacted_services=impacted_services,
+            root_causes=root_causes,
+            timeline=timeline,
+            lessons_learned=lessons_learned,
+        )
 
     def _score_breakdown(self) -> ScoreBreakdown:
         if not self._issue_state:
@@ -422,6 +581,13 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
                 return runtime
         return None
 
+    def _blocking_services(self, runtime: IssueRuntime) -> list[str]:
+        return [
+            self._issue_state[issue_id].definition.service
+            for issue_id in runtime.definition.prerequisites
+            if not self._issue_state[issue_id].resolved
+        ]
+
     def _service_is_impacted(self, service: str) -> bool:
         for runtime in self._issue_state.values():
             if runtime.resolved:
@@ -445,6 +611,79 @@ class IncidentResponseEnvironment(OpenEnvEnvironment):
         }
         investigated_services.update(self._investigation_notes)
         return sorted(investigated_services)
+
+    def _lessons_learned(self) -> list[str]:
+        cause_lessons = {
+            "out_of_memory": "Add headroom alerts and capacity review before heap saturation reaches the crash threshold.",
+            "bad_deploy": "Promote releases only after canary health checks and dependency smoke tests are green.",
+            "connection_leak": "Instrument connection pool leak detection and alert before the database exhausts client slots.",
+            "cache_memory_pressure": "Review cache capacity planning and hot-key protection before eviction storms form.",
+            "bad_model_deploy": "Gate model rollouts with artifact checksum validation and canary scoring before promotion.",
+            "dependency_timeout_storm": "Default circuit breakers should trip before a slow dependency saturates worker pools.",
+        }
+        lessons = [
+            cause_lessons.get(runtime.definition.display_cause, "Strengthen runbooks and alerts for this failure mode.")
+            for runtime in self._issue_state.values()
+        ]
+        if self._failed_actions:
+            lessons.append("Destructive actions should follow investigation evidence to avoid avoidable penalty.")
+        if self._done and not self._success():
+            lessons.append("Prioritize the highest-impact root causes sooner to stay within the step budget.")
+        return lessons
+
+    @staticmethod
+    def _snapshot_to_metrics(snapshot: MetricSnapshot) -> ServiceMetrics:
+        return ServiceMetrics(
+            cpu_usage=round(snapshot.cpu_usage, 4),
+            memory_usage=round(snapshot.memory_usage, 4),
+            error_rate=round(snapshot.error_rate, 4),
+            p99_latency_ms=snapshot.p99_latency_ms,
+            requests_per_minute=snapshot.requests_per_minute,
+            deploy_version=snapshot.deploy_version,
+        )
+
+    @classmethod
+    def _merge_metrics(cls, current: ServiceMetrics, candidate: MetricSnapshot) -> ServiceMetrics:
+        dominant_candidate = (
+            candidate.error_rate >= current.error_rate
+            or candidate.p99_latency_ms >= current.p99_latency_ms
+            or candidate.memory_usage >= current.memory_usage
+        )
+        deploy_version = candidate.deploy_version if dominant_candidate else current.deploy_version
+        return ServiceMetrics(
+            cpu_usage=round(max(current.cpu_usage, candidate.cpu_usage), 4),
+            memory_usage=round(max(current.memory_usage, candidate.memory_usage), 4),
+            error_rate=round(max(current.error_rate, candidate.error_rate), 4),
+            p99_latency_ms=max(current.p99_latency_ms, candidate.p99_latency_ms),
+            requests_per_minute=min(current.requests_per_minute, candidate.requests_per_minute),
+            deploy_version=deploy_version,
+        )
+
+    @staticmethod
+    def _blend_metrics(
+        baseline: MetricSnapshot,
+        impacted: MetricSnapshot,
+        blend_ratio: float,
+    ) -> MetricSnapshot:
+        inverse = 1.0 - blend_ratio
+        return MetricSnapshot(
+            cpu_usage=round((baseline.cpu_usage * inverse) + (impacted.cpu_usage * blend_ratio), 4),
+            memory_usage=round((baseline.memory_usage * inverse) + (impacted.memory_usage * blend_ratio), 4),
+            error_rate=round((baseline.error_rate * inverse) + (impacted.error_rate * blend_ratio), 4),
+            p99_latency_ms=int((baseline.p99_latency_ms * inverse) + (impacted.p99_latency_ms * blend_ratio)),
+            requests_per_minute=int(
+                (baseline.requests_per_minute * inverse) + (impacted.requests_per_minute * blend_ratio)
+            ),
+            deploy_version=impacted.deploy_version,
+        )
+
+    @staticmethod
+    def _format_action(entry: ActionJournalEntry) -> str:
+        if entry.action_type == "submit_diagnosis":
+            return f"submit_diagnosis({entry.service}, {entry.cause})"
+        if entry.service:
+            return f"{entry.action_type}({entry.service})"
+        return entry.action_type
 
     @staticmethod
     def _dedupe(items: list[str]) -> list[str]:

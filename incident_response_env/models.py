@@ -42,6 +42,42 @@ class ScoreBreakdown(BaseModel):
     total: float = 0.0
 
 
+class ServiceMetrics(BaseModel):
+    cpu_usage: float = 0.0
+    memory_usage: float = 0.0
+    error_rate: float = 0.0
+    p99_latency_ms: int = 0
+    requests_per_minute: int = 0
+    deploy_version: str = "unknown"
+
+
+class PostMortemIssue(BaseModel):
+    service: str
+    root_cause: str
+    remediation: ActionType
+    priority: int
+    blast_radius: list[str] = Field(default_factory=list)
+    investigated: bool = False
+    diagnosed: bool = False
+    resolved: bool = False
+    investigation_step: int | None = None
+    diagnosis_step: int | None = None
+    resolution_step: int | None = None
+
+
+class PostMortemReport(BaseModel):
+    status: Literal["in_progress", "resolved", "failed"]
+    incident_title: str
+    summary: str
+    total_steps: int
+    failed_actions: int = 0
+    final_score: float = 0.0
+    impacted_services: list[str] = Field(default_factory=list)
+    root_causes: list[PostMortemIssue] = Field(default_factory=list)
+    timeline: list[str] = Field(default_factory=list)
+    lessons_learned: list[str] = Field(default_factory=list)
+
+
 class IncidentAction(OpenEnvAction):
     type: ActionType
     service: str | None = None
@@ -71,12 +107,14 @@ class IncidentObservation(OpenEnvObservation):
     services: list[ServiceStatus]
     alerts: list[Alert]
     recent_logs: dict[str, list[str]]
+    metrics: dict[str, ServiceMetrics]
     action_feedback: str
     valid_actions: list[ActionType]
     investigated_services: list[str] = Field(default_factory=list)
     diagnosed_services: list[str] = Field(default_factory=list)
     resolved_services: list[str] = Field(default_factory=list)
     score_breakdown: ScoreBreakdown = Field(default_factory=ScoreBreakdown)
+    postmortem: PostMortemReport | None = None
 
 
 class IncidentState(OpenEnvState):
@@ -86,9 +124,11 @@ class IncidentState(OpenEnvState):
     services: list[ServiceStatus] = Field(default_factory=list)
     alerts: list[Alert] = Field(default_factory=list)
     recent_logs: dict[str, list[str]] = Field(default_factory=dict)
+    metrics: dict[str, ServiceMetrics] = Field(default_factory=dict)
     investigated_services: list[str] = Field(default_factory=list)
     diagnosed_services: list[str] = Field(default_factory=list)
     resolved_services: list[str] = Field(default_factory=list)
     failed_actions: int = 0
     success: bool = False
     score_breakdown: ScoreBreakdown = Field(default_factory=ScoreBreakdown)
+    postmortem: PostMortemReport | None = None

@@ -65,14 +65,15 @@ def schema() -> dict[str, Any]:
 
 
 @app.post("/reset")
-def reset(body: ResetBody) -> dict[str, Any]:
+def reset(body: ResetBody | None = None) -> dict[str, Any]:
     global _current_episode_id
 
+    payload = body or ResetBody()
     env = IncidentResponseEnvironment()
     observation = env.reset(
-        seed=body.seed,
-        episode_id=body.episode_id,
-        difficulty=body.difficulty,
+        seed=payload.seed,
+        episode_id=payload.episode_id,
+        difficulty=payload.difficulty,
     )
     episode_id = str(observation.metadata["episode_id"])
     _sessions[episode_id] = env
@@ -106,6 +107,15 @@ def state(episode_id: str | None = None) -> dict[str, Any]:
     if env is None:
         return IncidentState().model_dump()
     return env.state.model_dump()
+
+
+@app.get("/postmortem")
+def postmortem(episode_id: str | None = None) -> dict[str, Any]:
+    env = _resolve_env(episode_id)
+    if env is None:
+        return {"postmortem": None}
+    report = env.state.postmortem
+    return {"postmortem": report.model_dump() if report is not None else None}
 
 
 def main() -> None:

@@ -20,6 +20,12 @@ SERVICE_HINTS = [
     "api-gateway",
     "profile-service",
     "session-service",
+    "notifications-api",
+    "user-events-worker",
+    "smtp-gateway",
+    "frontend-web",
+    "search-api",
+    "query-cache",
 ]
 
 
@@ -36,6 +42,13 @@ def infer_cause_and_remediation(text: str) -> tuple[str | None, str | None]:
         return "connection_leak", "restart"
     if "maxmemory" in lowered or "evict" in lowered or "memory pressure" in lowered:
         return "cache_memory_pressure", "scale_up"
+    if (
+        "smtp-gateway" in lowered
+        or "circuit breaker" in lowered
+        or "timeout storm" in lowered
+        or "worker blocked on" in lowered
+    ):
+        return "dependency_timeout_storm", "enable_circuit_breaker"
     if "deploy" in lowered or "rollout" in lowered or "checksum" in lowered or "new build" in lowered:
         if "ranking-ml" in lowered or "model artifact" in lowered:
             return "bad_model_deploy", "rollback"
@@ -51,6 +64,10 @@ class HeuristicPlanner:
             return self._next_medium(observation)
         if observation.difficulty == "hard":
             return self._next_hard(observation)
+        if observation.difficulty == "severe":
+            return self._next_severe(observation)
+        if observation.difficulty == "critical":
+            return self._next_critical(observation)
         return self._next_generic(observation)
 
     def _next_easy(self, observation: IncidentObservation) -> IncidentAction:
@@ -61,6 +78,26 @@ class HeuristicPlanner:
         return self._next_planned_root_cause(
             observation=observation,
             root_service="auth-service",
+            diagnosis_cause="bad_deploy",
+            remediation="rollback",
+            investigation_plan=plan,
+        )
+
+    def _next_severe(self, observation: IncidentObservation) -> IncidentAction:
+        plan = ["user-events-worker", "notifications-api"]
+        return self._next_planned_root_cause(
+            observation=observation,
+            root_service="notifications-api",
+            diagnosis_cause="dependency_timeout_storm",
+            remediation="enable_circuit_breaker",
+            investigation_plan=plan,
+        )
+
+    def _next_critical(self, observation: IncidentObservation) -> IncidentAction:
+        plan = ["frontend-web", "query-cache", "search-api"]
+        return self._next_planned_root_cause(
+            observation=observation,
+            root_service="search-api",
             diagnosis_cause="bad_deploy",
             remediation="rollback",
             investigation_plan=plan,
@@ -94,18 +131,19 @@ class HeuristicPlanner:
 
         for phase in phases:
             root = phase["root"]
-            if root in diagnosed:
+            if root in diagnosed and root in resolved:
                 continue
             for service in phase["investigate"]:
                 if service not in investigated:
                     return IncidentAction(type="investigate", service=service)
+            if root not in diagnosed:
+                return IncidentAction(
+                    type="submit_diagnosis",
+                    service=root,
+                    cause=phase["cause"],
+                )
             if root not in resolved:
                 return IncidentAction(type=phase["remediation"], service=root)
-            return IncidentAction(
-                type="submit_diagnosis",
-                service=root,
-                cause=phase["cause"],
-            )
 
         return self._next_generic(observation)
 
@@ -122,12 +160,12 @@ class HeuristicPlanner:
         resolved = set(observation.resolved_services)
 
         if root_service in diagnosed:
+            if root_service not in resolved:
+                return IncidentAction(type=remediation, service=root_service)
             return self._next_generic(observation)
         for service in investigation_plan:
             if service not in investigated:
                 return IncidentAction(type="investigate", service=service)
-        if root_service not in resolved:
-            return IncidentAction(type=remediation, service=root_service)
         return IncidentAction(
             type="submit_diagnosis",
             service=root_service,
@@ -144,18 +182,18 @@ class HeuristicPlanner:
         resolved = set(observation.resolved_services)
 
         for service in investigated:
-            if service in resolved or service not in logs:
-                continue
-            cause, remediation = infer_cause_and_remediation(logs[service])
-            if remediation:
-                return IncidentAction(type=remediation, service=service)
-
-        for service in investigated:
             if service in diagnosed or service not in logs:
                 continue
             cause, _ = infer_cause_and_remediation(logs[service])
             if cause:
                 return IncidentAction(type="submit_diagnosis", service=service, cause=cause)
+
+        for service in investigated:
+            if service in resolved or service not in logs or service not in diagnosed:
+                continue
+            _, remediation = infer_cause_and_remediation(logs[service])
+            if remediation:
+                return IncidentAction(type=remediation, service=service)
 
         hinted_service = self._find_service_hint(observation)
         if hinted_service and hinted_service not in investigated:
@@ -205,10 +243,15 @@ class HeuristicPlanner:
             "auth-service": 1,
             "cache-cluster": 2,
             "ranking-ml": 3,
-            "api-gateway": 4,
-            "feature-store": 5,
-            "profile-service": 6,
-            "session-service": 7,
+            "notifications-api": 4,
+            "search-api": 5,
+            "api-gateway": 6,
+            "feature-store": 7,
+            "user-events-worker": 8,
+            "frontend-web": 9,
+            "query-cache": 10,
+            "profile-service": 11,
+            "session-service": 12,
         }
         return [
             service.name
@@ -272,6 +315,10 @@ class OpenAICompatiblePlanner:
             "services": [service.model_dump() for service in observation.services],
             "alerts": [alert.model_dump() for alert in observation.alerts],
             "recent_logs": observation.recent_logs,
+            "metrics": {
+                service: metric.model_dump()
+                for service, metric in observation.metrics.items()
+            },
             "investigated_services": observation.investigated_services,
             "diagnosed_services": observation.diagnosed_services,
             "resolved_services": observation.resolved_services,
@@ -349,6 +396,7 @@ class OpenAICompatiblePlanner:
     def _infer_cause(self, raw_text: str, observation: IncidentObservation) -> str:
         lowered = raw_text.lower()
         for cause in [
+            "dependency_timeout_storm",
             "bad_model_deploy",
             "cache_memory_pressure",
             "connection_leak",
@@ -364,6 +412,8 @@ class OpenAICompatiblePlanner:
             return "out_of_memory"
         if "checksum" in logs or "artifact" in logs:
             return "bad_model_deploy"
+        if "smtp-gateway" in logs or "circuit breaker" in logs or "timeout storm" in logs:
+            return "dependency_timeout_storm"
         if "deploy" in logs or "rollout" in logs:
             return "bad_deploy"
         if "too many clients" in logs or "connection pool" in logs:
