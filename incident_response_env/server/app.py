@@ -65,14 +65,15 @@ def schema() -> dict[str, Any]:
 
 
 @app.post("/reset")
-def reset(body: ResetBody) -> dict[str, Any]:
+def reset(body: ResetBody | None = None) -> dict[str, Any]:
     global _current_episode_id
 
+    payload = body or ResetBody()
     env = IncidentResponseEnvironment()
     observation = env.reset(
-        seed=body.seed,
-        episode_id=body.episode_id,
-        difficulty=body.difficulty,
+        seed=payload.seed,
+        episode_id=payload.episode_id,
+        difficulty=payload.difficulty,
     )
     episode_id = str(observation.metadata["episode_id"])
     _sessions[episode_id] = env

@@ -219,3 +219,15 @@ def test_http_postmortem_endpoint_returns_report() -> None:
     assert response.status_code == 200
     assert payload["postmortem"]["status"] == "in_progress"
     assert payload["postmortem"]["incident_title"] == "Single-Service Memory Exhaustion"
+
+
+def test_http_reset_accepts_empty_body() -> None:
+    client = TestClient(app)
+
+    response = client.post("/reset")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["observation"]["difficulty"] == "easy"
+    assert payload["done"] is False
+    assert payload["metadata"]["step_count"] == 0
