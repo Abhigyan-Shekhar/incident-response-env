@@ -7,3 +7,4 @@ type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
+tasks: [easy, medium, hard, severe, critical]

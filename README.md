@@ -13,13 +13,26 @@ tags:
 
 # 🚨 IncidentResponseEnv
 
-**An OpenEnv environment for SRE on-call incident triage.**
+**A deterministic OpenEnv benchmark for SRE incident investigation, diagnosis, and remediation under a bounded action budget.**
 
-IncidentResponseEnv drops an AI agent into a broken production system with realistic alerts, cascading failures, and noisy logs. The agent must investigate services, trace root causes across a dependency graph, apply the correct remediation, and submit a defensible diagnosis—all under a strict step budget.
+IncidentResponseEnv evaluates whether an agent can operate like an on-call production engineer: inspect alerts, logs, and service metrics; trace failures through dependencies; submit the correct root-cause diagnosis; and apply the right remediation without taking destructive actions on healthy systems.
 
-This is not a toy. SRE incident response is a real workflow at every software company. When a service degrades at 2 AM, the on-call engineer traces symptoms across dependencies, separates root cause from blast radius, applies the correct fix, and restores service under time pressure. This environment captures that entire loop.
+This is a real workflow, not a toy abstraction. SRE and platform teams routinely investigate cascading outages, rollout regressions, memory exhaustion, and dependency failures under time pressure. The benchmark focuses that workflow into a judgeable environment with explicit scenarios, fixed remediation mappings, normalized scores, and typed actions.
 
 > **Live Deployment:** [`utkrishtu-incident-response-env.hf.space`](https://utkrishtu-incident-response-env.hf.space)
+
+---
+
+## Benchmark Summary
+
+| Property | Value |
+|---|---|
+| **Domain** | Production SRE incident response |
+| **Task loop** | Investigate -> diagnose -> remediate |
+| **Action space** | `investigate`, `submit_diagnosis`, `rollback`, `scale_up`, `restart`, `enable_circuit_breaker` |
+| **Task set** | `easy`, `medium`, `hard`, `severe`, `critical` |
+| **Scoring** | Deterministic, normalized to `[0.0, 1.0]` |
+| **Validation surface** | Typed observations, typed actions, fixed scenarios, tested inference log format |
 
 ---
 
@@ -27,11 +40,40 @@ This is not a toy. SRE incident response is a real workflow at every software co
 
 | Criterion | How This Environment Satisfies It |
 |---|---|
-| **Real-world task** | SRE incident response is performed daily at every production software company |
-| **Sequential reasoning** | The agent must investigate → diagnose → remediate in the correct order |
-| **Operational cost** | Wrong destructive actions (e.g., restarting a healthy database) incur score penalties |
-| **Trajectory-sensitive grading** | Rewards accumulate per-step, not just at episode end |
-| **Difficulty progression** | Easy → Medium → Hard → Severe → Critical, from single-service incidents to high-blast-radius mitigation |
+| **Real-world utility** | Mirrors production on-call triage that software companies perform daily |
+| **Sequential reasoning** | Agents must gather evidence before diagnosis and remediation |
+| **Operational risk** | Wrong destructive actions incur explicit penalties |
+| **Trajectory sensitivity** | Partial credit accumulates over the full repair trajectory |
+| **Difficulty progression** | Scenarios scale from one failing service to overlapping multi-service incidents |
+
+---
+
+## Why This Is Easy To Judge
+
+- **Deterministic scenario definitions:** every incident is declared in code with fixed services, alerts, logs, metrics, and expected remediation.
+- **Explicit root-cause aliases:** each issue accepts a bounded set of normalized diagnosis aliases rather than free-form grading.
+- **Fixed remediation mapping:** every incident definition encodes the correct action for resolution.
+- **Bounded action space:** agents can only choose from six typed operations.
+- **Normalized score range:** totals are clamped to `[0.0, 1.0]` for straightforward comparison across tasks.
+- **Tested inference contract:** the repo validates that `inference.py` emits the required `[START]`, `[STEP]`, and `[END]` flow.
+
+---
+
+## Verified Baseline Results
+
+Current repo-local baseline using the root `inference.py` on the deterministic planner path produces:
+
+| Task | Score | Steps | Success |
+|---|---|---|---|
+| `easy` | `0.90` | `3` | `true` |
+| `medium` | `0.86` | `6` | `true` |
+| `hard` | `0.81` | `11` | `true` |
+| `severe` | `0.88` | `4` | `true` |
+| `critical` | `0.87` | `5` | `true` |
+
+**Mean score across all tasks: `0.86`**
+
+The baseline completes all five tasks successfully while preserving deterministic reward values in the normalized `[0.0, 1.0]` range.
 
 ---
 
@@ -199,24 +241,6 @@ Scores are **deterministic** and clamped to `[0.0, 1.0]`. The reward function pr
 On multi-root-cause incidents (hard), restoration and diagnosis are proportionally split across issues.
 
 This repo also preserves deterministic grading for the new scenarios: `severe` tests dependency isolation with `enable_circuit_breaker`, and `critical` adds another release-regression incident with corroboration requirements.
-
----
-
-## Verified Baseline Results
-
-Current repo-local baseline using the root `inference.py` on the deterministic planner path produces:
-
-| Task | Score | Steps | Success |
-|---|---|---|---|
-| `easy` | `0.90` | `3` | `true` |
-| `medium` | `0.86` | `6` | `true` |
-| `hard` | `0.81` | `11` | `true` |
-| `severe` | `0.88` | `4` | `true` |
-| `critical` | `0.87` | `5` | `true` |
-
-**Mean score across all tasks: `0.86`**
-
-The current baseline completes all five tasks successfully while preserving reward values in the normalized `[0.0, 1.0]` range.
 
 ---
 

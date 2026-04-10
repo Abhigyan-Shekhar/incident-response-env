@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..compat import OPENENV_AVAILABLE, openenv_create_app
 from ..environment import IncidentResponseEnvironment
 from ..models import IncidentAction, IncidentObservation, IncidentState
 
@@ -25,9 +27,45 @@ class StepBody(BaseModel):
     timeout_s: float | None = None
 
 
-app = FastAPI(title="IncidentResponseEnv", version="0.1.0")
 _sessions: dict[str, IncidentResponseEnvironment] = {}
 _current_episode_id: str | None = None
+
+ENV_NAME = "incident_response_env"
+MAX_CONCURRENT_ENVS = int(os.environ.get("MAX_CONCURRENT_ENVS", "32"))
+
+
+def create_environment() -> IncidentResponseEnvironment:
+    return IncidentResponseEnvironment()
+
+
+def _remove_route(app: FastAPI, path: str, methods: set[str]) -> None:
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if not (
+            getattr(route, "path", None) == path
+            and methods <= (getattr(route, "methods", set()) or set())
+        )
+    ]
+
+
+if OPENENV_AVAILABLE and openenv_create_app is not None:
+    app = openenv_create_app(
+        create_environment,
+        IncidentAction,
+        IncidentObservation,
+        env_name=ENV_NAME,
+        max_concurrent_envs=MAX_CONCURRENT_ENVS,
+    )
+    for path, methods in (
+        ("/reset", {"POST"}),
+        ("/step", {"POST"}),
+        ("/state", {"GET"}),
+        ("/schema", {"GET"}),
+    ):
+        _remove_route(app, path, methods)
+else:
+    app = FastAPI(title="IncidentResponseEnv", version="0.1.0")
 
 
 def _resolve_env(episode_id: str | None) -> IncidentResponseEnvironment | None:
