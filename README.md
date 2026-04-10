@@ -48,7 +48,7 @@ This is a real workflow, not a toy abstraction. SRE and platform teams routinely
 
 ---
 
-## Why This Is Easy To Judge
+## Features
 
 - **Deterministic scenario definitions:** every incident is declared in code with fixed services, alerts, logs, metrics, and expected remediation.
 - **Explicit root-cause aliases:** each issue accepts a bounded set of normalized diagnosis aliases rather than free-form grading.
